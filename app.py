@@ -4,63 +4,113 @@ import os
 from pathlib import Path
 import secrets
 import time
+import threading
 
 import certifi
-from cryptography.fernet import Fernet
-from flask import Flask, jsonify, request
+from cryptography.fernet import Fernet, InvalidToken
+from flask import Flask, jsonify, request, g
 from sqlalchemy import (Column, Float, Integer, LargeBinary, MetaData, String,
                         Table, create_engine, event, text)
 from sqlalchemy.pool import NullPool
+from sqlalchemy.exc import SQLAlchemyError, ArgumentError
 from werkzeug.security import generate_password_hash, check_password_hash
 
 
-def create_app(database=None):
+class SetupError(Exception):
+    def __init__(self, code, message):
+        self.code = code
+        self.message = message
+
+
+def create_app(database=None, require_external=False):
     app = Flask(__name__, static_folder='static')
     app.config['MAX_CONTENT_LENGTH'] = 100_000
-    remote_url = os.environ.get('DATABASE_URL') if database is None else None
-    key = os.environ.get('ENCRYPTION_KEY')
-    if os.environ.get('VERCEL') and (not remote_url or not key):
-        raise RuntimeError('Vercel requires DATABASE_URL and ENCRYPTION_KEY.')
-    if remote_url and not key:
-        raise RuntimeError('External database requires a persistent ENCRYPTION_KEY.')
-    folder = Path(os.environ.get('DATA_DIR', Path(__file__).parent / 'data'))
-    if not key:
-        folder.mkdir(mode=0o700, parents=True, exist_ok=True)
-        keyfile = folder / 'encryption.key'
+    state = None
+    initialization_lock = threading.Lock()
+
+    def initialize_storage():
+        remote_url = (os.environ.get('DATABASE_URL') or '').strip() if database is None else None
+        key = (os.environ.get('ENCRYPTION_KEY') or '').strip()
+        if (require_external or os.environ.get('VERCEL')) and not remote_url:
+            raise SetupError('DATABASE_URL_MISSING', '保存先が未設定です。VercelのDATABASE_URLを確認してください。')
+        if remote_url and not key:
+            raise SetupError('ENCRYPTION_KEY_MISSING', '暗号鍵が未設定です。VercelのENCRYPTION_KEYを確認してください。')
+        folder = Path(os.environ.get('DATA_DIR', Path(__file__).parent / 'data'))
+        if not key:
+            folder.mkdir(mode=0o700, parents=True, exist_ok=True)
+            keyfile = folder / 'encryption.key'
+            try:
+                fd = os.open(keyfile, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            except FileExistsError:
+                pass
+            else:
+                with os.fdopen(fd, 'wb') as f:
+                    f.write(Fernet.generate_key())
+            key = keyfile.read_bytes()
         try:
-            fd = os.open(keyfile, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        except FileExistsError:
-            pass
+            cipher = Fernet(key)
+        except (ValueError, TypeError):
+            raise SetupError('ENCRYPTION_KEY_INVALID', '暗号鍵の形式が正しくありません。ENCRYPTION_KEYを確認してください。') from None
+        if remote_url:
+            if not remote_url.startswith(('postgresql://', 'postgres://', 'postgresql+psycopg://')):
+                raise SetupError('DATABASE_URL_INVALID', '保存先URLの形式が正しくありません。DATABASE_URLを確認してください。')
+            url = remote_url.replace('postgres://', 'postgresql+psycopg://', 1).replace('postgresql://', 'postgresql+psycopg://', 1)
+            # Neon certificates are validated against the system trust store.
+            engine = create_engine(url, poolclass=NullPool, hide_parameters=True,
+                                   connect_args={'sslmode': 'verify-full', 'sslrootcert': certifi.where(), 'connect_timeout': 10})
         else:
-            with os.fdopen(fd, 'wb') as f:
-                f.write(Fernet.generate_key())
-        key = keyfile.read_bytes()
-    cipher = Fernet(key)
-    if remote_url:
-        if not remote_url.startswith(('postgresql://', 'postgres://', 'postgresql+psycopg://')):
-            raise RuntimeError('DATABASE_URL must use PostgreSQL.')
-        url = remote_url.replace('postgres://', 'postgresql+psycopg://', 1).replace('postgresql://', 'postgresql+psycopg://', 1)
-        # Neon certificates are validated against the system trust store.
-        engine = create_engine(url, poolclass=NullPool, hide_parameters=True,
-                               connect_args={'sslmode': 'verify-full', 'sslrootcert': certifi.where(), 'connect_timeout': 10})
-    else:
-        folder.mkdir(mode=0o700, parents=True, exist_ok=True)
-        engine = create_engine('sqlite:///' + str(database or folder / 'files.sqlite3'),
-                               connect_args={'timeout': 15}, hide_parameters=True)
-        @event.listens_for(engine, 'connect')
-        def secure_delete(connection, _):
-            connection.execute('PRAGMA secure_delete=ON')
-    metadata = MetaData()
-    Table('files', metadata,
-          Column('number', String, primary_key=True), Column('payload', LargeBinary, nullable=False),
-          Column('password', String, nullable=False), Column('manager', String, unique=True, nullable=False),
-          Column('created', Float, nullable=False),
-          # Kept for compatibility with earlier SQLite databases; never used for expiry.
-          Column('expires', Float, nullable=False), Column('opened', Float))
-    Table('attempts', metadata, Column('key', String, primary_key=True),
-          Column('count', Integer), Column('until', Float))
-    metadata.create_all(engine)
-    app.db_engine = engine
+            folder.mkdir(mode=0o700, parents=True, exist_ok=True)
+            engine = create_engine('sqlite:///' + str(database or folder / 'files.sqlite3'),
+                                   connect_args={'timeout': 15}, hide_parameters=True)
+            @event.listens_for(engine, 'connect')
+            def secure_delete(connection, _):
+                connection.execute('PRAGMA secure_delete=ON')
+        metadata = MetaData()
+        Table('files', metadata,
+              Column('number', String, primary_key=True), Column('payload', LargeBinary, nullable=False),
+              Column('password', String, nullable=False), Column('manager', String, unique=True, nullable=False),
+              Column('created', Float, nullable=False),
+              # Kept for compatibility with earlier SQLite databases; never used for expiry.
+              Column('expires', Float, nullable=False), Column('opened', Float))
+        Table('attempts', metadata, Column('key', String, primary_key=True),
+              Column('count', Integer), Column('until', Float))
+        try:
+            with engine.begin() as connection:
+                # Concurrent cold starts must not race while creating the first tables.
+                if engine.dialect.name == 'postgresql':
+                    connection.execute(text('SELECT pg_advisory_xact_lock(731906042)'))
+                metadata.create_all(connection)
+        except Exception:
+            engine.dispose()
+            raise
+        app.db_engine = engine
+        return engine, cipher
+
+    def storage():
+        nonlocal state
+        if state is None:
+            with initialization_lock:
+                if state is None:
+                    state = initialize_storage()
+        return state
+
+    @app.errorhandler(SetupError)
+    def setup_error(error):
+        return jsonify(error=error.message, code=error.code), 503
+
+    @app.errorhandler(ArgumentError)
+    def invalid_database_url(error):
+        return jsonify(error='保存先URLの形式が正しくありません。DATABASE_URLを確認してください。', code='DATABASE_URL_INVALID'), 503
+
+    @app.errorhandler(SQLAlchemyError)
+    def database_error(error):
+        # Never put connection URLs, passwords, SQL parameters or raw driver errors in responses/logs.
+        app.logger.warning('Storage operation failed (%s)', type(error).__name__)
+        return jsonify(error='データベースに接続できません。少し待って再試行してください。続く場合は管理者による接続設定の確認が必要です。', code='DATABASE_UNAVAILABLE'), 503
+
+    @app.errorhandler(InvalidToken)
+    def decrypt_error(error):
+        return jsonify(error='ファイルを復号できません。保存時の暗号鍵が必要です。', code='FILE_DECRYPT_FAILED'), 503
 
     @app.before_request
     def protect():
@@ -69,6 +119,8 @@ def create_app(database=None):
                 return jsonify(error='ページを再読み込みしてください。'), 403
             if not isinstance(request.get_json(silent=True), dict):
                 return jsonify(error='入力内容を確認してください。'), 400
+        if request.path.startswith('/api/'):
+            g.storage = storage()
 
     @app.after_request
     def headers(response):
@@ -97,8 +149,16 @@ def create_app(database=None):
     def home():
         return app.send_static_file('index.html')
 
+    @app.get('/api/status')
+    def status():
+        engine, _ = g.storage
+        with engine.connect() as connection:
+            connection.execute(text('SELECT 1'))
+        return jsonify(ready=True, deletion='manual')
+
     @app.post('/api/files')
     def create():
+        engine, cipher = g.storage
         body = request.get_json()
         name, password, content = (body.get(x) for x in ('name', 'password', 'content'))
         if not all(isinstance(x, str) for x in (name, password, content)):
@@ -126,6 +186,7 @@ def create_app(database=None):
 
     @app.post('/api/open')
     def open_file():
+        engine, cipher = g.storage
         body = request.get_json()
         number, password = body.get('number'), body.get('password')
         if not isinstance(number, str) or not isinstance(password, str) or len(password)>200:
@@ -140,6 +201,7 @@ def create_app(database=None):
 
     @app.post('/api/manage')
     def manage():
+        engine, cipher = g.storage
         body = request.get_json()
         token = body.get('token')
         if not isinstance(token,str) or len(token)>100:

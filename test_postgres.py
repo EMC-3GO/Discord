@@ -14,6 +14,7 @@ def test_postgres_lifecycle(monkeypatch):
     monkeypatch.setenv('ENCRYPTION_KEY',Fernet.generate_key().decode())
     monkeypatch.setattr(module,'create_engine',lambda *args,**kwargs:engine)
     app = module.create_app()
+    assert app.test_client().get('/api/status').json['ready'] is True
     headers={'X-Requested-With':'OneTimeFile'}
     with engine.begin() as db:
         db.execute(text('DELETE FROM files'))

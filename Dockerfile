@@ -5,6 +5,7 @@ COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt && useradd --uid 10001 --create-home app && mkdir -p /var/lib/onetime-file && chown app:app /var/lib/onetime-file
 COPY --chown=app:app app.py ./
 COPY --chown=app:app static/ ./static/
+COPY --chown=app:app api/ ./api/
 USER app
 EXPOSE 3000
 CMD ["sh", "-c", "exec gunicorn 'app:create_app()' --bind 0.0.0.0:${PORT:-3000} --workers 1 --threads 4 --error-logfile -"]

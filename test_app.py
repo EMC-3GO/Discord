@@ -94,8 +94,10 @@ def test_vercel_requires_persistent_configuration(monkeypatch):
     monkeypatch.setenv('VERCEL','1')
     monkeypatch.delenv('DATABASE_URL',raising=False)
     monkeypatch.delenv('ENCRYPTION_KEY',raising=False)
-    with pytest.raises(RuntimeError,match='requires DATABASE_URL'):
-        module.create_app()
+    client=module.create_app().test_client()
+    assert client.get('/').status_code==200
+    assert client.get('/api/status').json['code']=='DATABASE_URL_MISSING'
+    assert client.get('/api/status').status_code==503
 
 
 def test_malformed_json(setup):
@@ -120,7 +122,69 @@ def test_serverless_initialization_uses_packaged_trust_store(tmp_path,monkeypatc
     monkeypatch.setenv('DATA_DIR',str(tmp_path/'must-not-write'))
     app=module.create_app()
     assert app.test_client().get('/').status_code==200
+    assert captured=={}
+    assert app.test_client().get('/api/status').json['ready'] is True
     assert not (tmp_path/'must-not-write').exists()
     assert captured['connect_args']['sslmode']=='verify-full'
     assert captured['connect_args']['sslrootcert']==certifi.where()
     assert Path(certifi.where()).is_file()
+
+
+@pytest.mark.parametrize('configuration,code',[
+    ({},'DATABASE_URL_MISSING'),
+    ({'DATABASE_URL':'postgresql://example.invalid/db'},'ENCRYPTION_KEY_MISSING'),
+    ({'DATABASE_URL':'postgresql://example.invalid/db','ENCRYPTION_KEY':'not-a-valid-key'},'ENCRYPTION_KEY_INVALID'),
+])
+def test_serverless_misconfiguration_preserves_page(monkeypatch,tmp_path,configuration,code):
+    monkeypatch.delenv('DATABASE_URL',raising=False)
+    monkeypatch.delenv('ENCRYPTION_KEY',raising=False)
+    monkeypatch.delenv('VERCEL',raising=False)
+    monkeypatch.setenv('DATA_DIR',str(tmp_path/'read-only-storage'))
+    for name,value in configuration.items():
+        monkeypatch.setenv(name,value)
+    client=module.create_app(require_external=True).test_client()
+    assert client.get('/').status_code==200
+    assert client.get('/static/app.js').status_code==200
+    result=client.get('/api/status')
+    assert result.status_code==503 and result.json['code']==code
+    assert not (tmp_path/'read-only-storage').exists()
+    for value in configuration.values():
+        assert value not in result.get_data(as_text=True)
+
+
+def test_database_failure_can_recover_without_restart(monkeypatch,tmp_path,caplog):
+    from cryptography.fernet import Fernet
+    from sqlalchemy import create_engine
+    from sqlalchemy.exc import OperationalError
+    monkeypatch.setenv('DATABASE_URL','postgresql://username:private-test-password@example.invalid/db')
+    monkeypatch.setenv('ENCRYPTION_KEY',Fernet.generate_key().decode())
+    local=create_engine('sqlite:///'+str(tmp_path/'recover.db'))
+    attempts=[0]
+    def flaky_engine(*args,**kwargs):
+        attempts[0]+=1
+        if attempts[0]==1:
+            raise OperationalError('private-test-password',{},Exception('private-test-password'))
+        return local
+    monkeypatch.setattr(module,'create_engine',flaky_engine)
+    client=module.create_app(require_external=True).test_client()
+    assert client.get('/').status_code==200
+    failure=client.get('/api/status')
+    assert failure.status_code==503
+    assert failure.json['code']=='DATABASE_UNAVAILABLE'
+    assert 'private-test-password' not in failure.get_data(as_text=True)
+    assert 'private-test-password' not in caplog.text
+    assert client.get('/api/status').json['ready'] is True
+    saved=create(client)
+    assert post(client,'/api/manage',{'token':saved['manager'],'delete':True}).json['deleted'] is True
+
+
+def test_actual_vercel_entrypoint_without_configuration(monkeypatch):
+    import importlib.util
+    from pathlib import Path
+    monkeypatch.delenv('DATABASE_URL',raising=False)
+    monkeypatch.delenv('ENCRYPTION_KEY',raising=False)
+    spec=importlib.util.spec_from_file_location('serverless_entry_test',Path(__file__).parent/'api/index.py')
+    entry=importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(entry)
+    assert entry.app.test_client().get('/').status_code==200
+    assert entry.app.test_client().get('/api/status').json['code']=='DATABASE_URL_MISSING'
