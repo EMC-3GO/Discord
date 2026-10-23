@@ -101,3 +101,26 @@ def test_vercel_requires_persistent_configuration(monkeypatch):
 def test_malformed_json(setup):
     _,client,_,_=setup
     assert post(client,'/api/open',[]).status_code==400
+
+
+def test_serverless_initialization_uses_packaged_trust_store(tmp_path,monkeypatch):
+    from cryptography.fernet import Fernet
+    from sqlalchemy import create_engine
+    import certifi
+    from pathlib import Path
+    captured={}
+    local=create_engine('sqlite:///' + str(tmp_path/'serverless.db'))
+    def engine_for_test(url,**kwargs):
+        captured.update(kwargs)
+        return local
+    monkeypatch.setattr(module,'create_engine',engine_for_test)
+    monkeypatch.setenv('VERCEL','1')
+    monkeypatch.setenv('DATABASE_URL','postgresql://example.invalid/database')
+    monkeypatch.setenv('ENCRYPTION_KEY',Fernet.generate_key().decode())
+    monkeypatch.setenv('DATA_DIR',str(tmp_path/'must-not-write'))
+    app=module.create_app()
+    assert app.test_client().get('/').status_code==200
+    assert not (tmp_path/'must-not-write').exists()
+    assert captured['connect_args']['sslmode']=='verify-full'
+    assert captured['connect_args']['sslrootcert']==certifi.where()
+    assert Path(certifi.where()).is_file()

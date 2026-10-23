@@ -5,6 +5,7 @@ from pathlib import Path
 import secrets
 import time
 
+import certifi
 from cryptography.fernet import Fernet
 from flask import Flask, jsonify, request
 from sqlalchemy import (Column, Float, Integer, LargeBinary, MetaData, String,
@@ -41,7 +42,7 @@ def create_app(database=None):
         url = remote_url.replace('postgres://', 'postgresql+psycopg://', 1).replace('postgresql://', 'postgresql+psycopg://', 1)
         # Neon certificates are validated against the system trust store.
         engine = create_engine(url, poolclass=NullPool, hide_parameters=True,
-                               connect_args={'sslmode': 'verify-full', 'sslrootcert': '/etc/ssl/certs/ca-certificates.crt', 'connect_timeout': 10})
+                               connect_args={'sslmode': 'verify-full', 'sslrootcert': certifi.where(), 'connect_timeout': 10})
     else:
         folder.mkdir(mode=0o700, parents=True, exist_ok=True)
         engine = create_engine('sqlite:///' + str(database or folder / 'files.sqlite3'),

@@ -4,3 +4,4 @@ gunicorn==23.0.0
 pytest==8.4.2
 SQLAlchemy==2.0.48
 psycopg[binary]==3.3.3
+certifi==2026.7.22
